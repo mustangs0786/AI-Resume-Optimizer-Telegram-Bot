@@ -1626,7 +1626,19 @@ async def handle_wrong_in_resume_state(update: Update, context: ContextTypes.DEF
     return WAITING_RESUME
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-
+def resolve_resume_path(context, user_id):
+    resume_path = context.user_data.get("resume_path", "")
+    
+    if resume_path and Path(resume_path).exists():
+        return resume_path          # ← file exists, use it
+    
+    # File gone — fall back to profile
+    saved_pdf, _ = get_latest_resume(user_id)
+    if saved_pdf and saved_pdf.exists():
+        context.user_data["resume_path"] = str(saved_pdf)  # update context
+        return str(saved_pdf)       # ← use profile version instead
+    
+    return None                     # ← nothing found, show error
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         ("start",      "Main menu — optimize, find jobs, update resume"),
