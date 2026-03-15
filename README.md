@@ -137,7 +137,7 @@ python bot.py
 4. Enter a username: e.g. `my_resume_optimizer_bot` *(must end in `bot`)*
 5. BotFather gives you a token like:
    ```
-   8706051751:AAG0z-mqzagUizvwi-cQAQ8RonLCG-LPFTw
+   8706051751:A********Tw
    ```
 6. Copy this into your `.env` as `TELEGRAM_BOT_TOKEN`
 
