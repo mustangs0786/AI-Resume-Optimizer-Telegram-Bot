@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# Generated files — don't commit user data
+temp_resumes/
+output/
+user_profiles/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.uv/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
