@@ -26,7 +26,7 @@ from telegram import (
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ConversationHandler,
-    ContextTypes, filters,
+    ContextTypes, filters, PicklePersistence,
 )
 from telegram.constants import ParseMode, ChatAction
 
@@ -48,6 +48,7 @@ from prompts import (
     REWRITE_THRESHOLD,
 )
 
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -67,9 +68,6 @@ if not GEMINI_KEY:
 
 gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-# Model tiers — strict rule:
-# PRO       → rewrite only (build_rewrite_with_context_prompt)
-# FLASH     → everything else (analysis, questions, update, ranking, ATS fallback)
 PRO_MODEL   = "gemini-3.1-pro-preview"
 FLASH_MODEL = "gemini-flash-lite-latest"
 FLASH_PRO   = "gemini-flash-latest"
@@ -80,6 +78,17 @@ PROFILES_DIR = Path("user_profiles")
 for d in (TEMP_DIR, OUTPUT_DIR, PROFILES_DIR):
     d.mkdir(exist_ok=True)
 
+def cleanup_output_dir(keep: int = 50):
+    pdfs = sorted(OUTPUT_DIR.glob("*.pdf"), key=lambda f: f.stat().st_mtime, reverse=True)
+    for old_pdf in pdfs[keep:]:
+        try:
+            old_pdf.unlink()
+        except Exception:
+            pass
+
+ACCESS_KEY   = os.getenv("ACCESS_KEY", "")
+FREE_LIMIT   = 5
+
 # ── User profile storage ──────────────────────────────────────────────────────
 
 def get_user_dir(user_id: int) -> Path:
@@ -88,7 +97,6 @@ def get_user_dir(user_id: int) -> Path:
     return d
 
 def save_resume_for_user(user_id: int, pdf_path: str, md_text: str = "") -> Path:
-    """Save PDF + markdown to profile. Keep last 5 versions."""
     user_dir = get_user_dir(user_id)
     version  = len(sorted(user_dir.glob("resume_v*.pdf"))) + 1
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -102,7 +110,6 @@ def save_resume_for_user(user_id: int, pdf_path: str, md_text: str = "") -> Path
     return saved
 
 def get_latest_resume(user_id: int) -> tuple:
-    """(latest_pdf, latest_md) or (None, None)."""
     pdfs = sorted(get_user_dir(user_id).glob("resume_v*.pdf"))
     if not pdfs:
         return None, None
@@ -113,24 +120,96 @@ def get_latest_resume(user_id: int) -> tuple:
 def list_user_resumes(user_id: int) -> list:
     return sorted(get_user_dir(user_id).glob("resume_v*.pdf"), reverse=True)
 
+# ── Access control ────────────────────────────────────────────────────────────
+
+def get_access_file(user_id: int) -> Path:
+    return get_user_dir(user_id) / "access.json"
+
+def load_access(user_id: int) -> dict:
+    f = get_access_file(user_id)
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"uses": 0, "unlocked": False}
+
+def save_access(user_id: int, data: dict):
+    get_access_file(user_id).write_text(json.dumps(data), encoding="utf-8")
+
+def increment_use(user_id: int) -> dict:
+    data = load_access(user_id)
+    if not data["unlocked"]:
+        data["uses"] = data.get("uses", 0) + 1
+    save_access(user_id, data)
+    return data
+
+def is_allowed(user_id: int) -> bool:
+    data = load_access(user_id)
+    return data.get("unlocked", False) or data.get("uses", 0) < FREE_LIMIT
+
+def remaining_uses(user_id: int) -> int:
+    data = load_access(user_id)
+    if data.get("unlocked"):
+        return 999
+    return max(0, FREE_LIMIT - data.get("uses", 0))
+
+async def handle_access_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text    = update.message.text.strip()
+    user_id = update.effective_user.id
+    if not ACCESS_KEY:
+        await update.message.reply_text("No access key configured. Contact the bot owner.")
+        return
+    if text == ACCESS_KEY:
+        data = load_access(user_id)
+        data["unlocked"] = True
+        save_access(user_id, data)
+        await update.message.reply_text(
+            "Access unlocked! You now have unlimited resume generations. Use /start to continue.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            "Invalid key. Please check and try again, or contact the bot owner.",
+        )
+
+async def _check_limit_and_gate(message, user_id: int) -> bool:
+    if is_allowed(user_id):
+        return True
+    await message.reply_text(
+        "Free limit reached! You have used your " + str(FREE_LIMIT) + " free resume generations."
+        " To continue, type your access key in chat. Contact the bot owner if you need one.",
+    )
+    return False
+
+def resolve_resume_path(context, user_id: int) -> str | None:
+    resume_path = context.user_data.get("resume_path", "")
+    if resume_path and Path(resume_path).exists():
+        return resume_path
+    saved_pdf, _ = get_latest_resume(user_id)
+    if saved_pdf and saved_pdf.exists():
+        context.user_data["resume_path"] = str(saved_pdf)
+        logger.info(f"resume_path missing, fell back to profile: {saved_pdf}")
+        return str(saved_pdf)
+    return None
+
 # ── Conversation states ───────────────────────────────────────────────────────
 (
-    WAITING_RESUME,           # 0 — waiting for resume upload
-    WAITING_MAIN_CHOICE,      # 1 — 3 main buttons shown
-    WAITING_RESUME_UPDATE,    # 2 — waiting for update text/voice
-    WAITING_JOB_PREFS,        # 3 — role / city / experience
-    WAITING_JOB_TIME,         # 4 — time filter picker
-    WAITING_JOB_URL,          # 5 — waiting for job link paste
-    WAITING_CLARIFICATION,    # 6 — clarifying questions
-    WAITING_SKILLS_INPUT,     # 7 — extra skills confirmation
-    WAITING_ATS_CONFIRM,      # 8 — ask user before running ATS
-    WAITING_UPDATE_CONFIRM,   # 9 — user reviews merged resume before PRO rewrite
+    WAITING_RESUME,
+    WAITING_MAIN_CHOICE,
+    WAITING_RESUME_UPDATE,
+    WAITING_JOB_PREFS,
+    WAITING_JOB_TIME,
+    WAITING_JOB_URL,
+    WAITING_CLARIFICATION,
+    WAITING_SKILLS_INPUT,
+    WAITING_ATS_CONFIRM,
+    WAITING_UPDATE_CONFIRM,
 ) = range(10)
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def call_llm(prompt: str, model_name: str = FLASH_MODEL) -> dict:
-    """Returns parsed JSON. Retries on 503/429."""
     import time
     FALLBACKS = [model_name, "gemini-2.5-pro", "gemini-2.0-flash"]
     last_err  = None
@@ -159,7 +238,6 @@ def call_llm(prompt: str, model_name: str = FLASH_MODEL) -> dict:
     raise RuntimeError(f"All models failed: {last_err}")
 
 def call_llm_text(prompt: str, model_name: str = FLASH_MODEL) -> str:
-    """Free-form text response."""
     r = gemini_client.models.generate_content(
         model=model_name,
         contents=prompt,
@@ -168,8 +246,6 @@ def call_llm_text(prompt: str, model_name: str = FLASH_MODEL) -> str:
     return r.text.strip()
 
 # ── Voice transcription ───────────────────────────────────────────────────────
-# Telegram voice → .ogg → Gemini File API → text
-# Used in resume update path
 
 async def transcribe_voice(path: str) -> str:
     import time as _t
@@ -199,7 +275,7 @@ async def transcribe_voice(path: str) -> str:
     except Exception as e:
         return f"[Transcription failed: {e}]"
 
-# ── Clarifying questions prompt ───────────────────────────────────────────────
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
 def build_clarifying_questions_prompt(jd: str, resume: str, analysis: dict) -> str:
     missing_crit = "\n".join(f"- {s}" for s in analysis.get("missing_critical", []))
@@ -228,8 +304,6 @@ Return JSON only:
 Rules: should_ask=false if resume covers everything. Max 3 questions, 1 sentence each.
 """
 
-# ── Format helpers ────────────────────────────────────────────────────────────
-
 def fmt_analysis(analysis: dict, score: int, match_level: str) -> str:
     bar   = "🟩" * int(score/5) + "⬜" * (20 - int(score/5))
     text  = f"📊 *Match Analysis*\n\nScore: *{score}/100* — {match_level}\n{bar}\n\n"
@@ -256,8 +330,6 @@ def fmt_roadmap(guidance: dict) -> str:
         text += f"\n💪 _{guidance['encouragement']}_"
     return text
 
-# ── Resume analysis prompt (for update path) ─────────────────────────────────
-
 def build_resume_analysis_prompt(resume_text: str) -> str:
     return f"""
 You are a senior resume coach. Analyze this resume and identify what is missing or weak.
@@ -277,13 +349,9 @@ Return JSON only:
 }}
 """
 
-# ── Resume update prompt ──────────────────────────────────────────────────────
-
 def build_resume_update_prompt(existing_resume: str, user_update: str) -> str:
     from datetime import date
-    today = date.today()
-    today_str = today.strftime("%b %Y")
-
+    today_str = date.today().strftime("%b %Y")
     return f"""
 You are an expert resume editor. Your ONLY job is to merge new information
 into an existing resume. Do NOT rewrite style or tone — just add/update facts.
@@ -302,7 +370,6 @@ into an existing resume. Do NOT rewrite style or tone — just add/update facts.
    - Find the earliest career start date across ALL roles
    - Calculate total experience from that date to TODAY ({today_str})
    - Express as "X years Y months" — NEVER round to whole years
-     Examples: "3 years 1 month", "5 years 8 months", "2 years 11 months"
    - If candidate explicitly states their experience (e.g. "5.6 years"),
      convert it properly: 5.6 years = 5 years 7 months
    - Update the Summary section to reflect the correct total
@@ -338,8 +405,6 @@ Return JSON only, no markdown fences:
 }}
 """
 
-# ── Job ranking prompt ────────────────────────────────────────────────────────
-
 def build_job_ranking_prompt(jobs: list, resume_text: str) -> str:
     jobs_text = "\n\n".join(
         f"JOB {i+1}:\nTitle: {j.get('title','')}\nCompany: {j.get('company','')}\n"
@@ -355,8 +420,6 @@ score each job for fit with the candidate's profile.
 
 ## JOB POSTINGS:
 {jobs_text}
-
-For each job, give a match score and short reason based purely on the resume content.
 
 Return JSON only:
 {{
@@ -375,10 +438,9 @@ Return JSON only:
 Sort by match_score descending. Include ALL jobs.
 """
 
-# ── ATS auto-fix (internal, no user prompt) ───────────────────────────────────
+# ── ATS auto-fix ──────────────────────────────────────────────────────────────
 
 async def _run_ats_and_fix(message, context, resume_md: str, pdf_path: str):
-    """Run ATS check + auto-fix. Uses FLASH_PRO for formatting fix."""
     jd = context.user_data.get("job_description", "")
     await message.reply_text("🔍 Running ATS analysis...")
     ats = None
@@ -394,7 +456,6 @@ async def _run_ats_and_fix(message, context, resume_md: str, pdf_path: str):
     if formatting_issues and ats.has_fixable_issues():
         await message.reply_text(f"Found {len(formatting_issues)} formatting issue(s) — auto-fixing...")
         try:
-            # FLASH for ATS fix
             fix   = call_llm(build_formatting_fix_prompt(resume_md, jd, formatting_issues, ats.overall_score), FLASH_PRO)
             fixed = fix.get("optimized_resume_text", "")
             if fixed:
@@ -413,8 +474,8 @@ async def _run_ats_and_fix(message, context, resume_md: str, pdf_path: str):
         except Exception as e:
             await message.reply_text(f"Auto-fix failed: {e}")
     if skill_gaps:
-        gaps = "\n".join(f"  - {g}" for g in skill_gaps[:6])
-        kws  = "\n".join(f"  - {k}" for k in ats.keyword_misses[:6])
+        gaps  = "\n".join(f"  - {g}" for g in skill_gaps[:6])
+        kws   = "\n".join(f"  - {k}" for k in ats.keyword_misses[:6])
         parts = ["*Skill gaps — need real experience:*\n", gaps]
         if ats.keyword_misses:
             parts.append(f"\n*Missing JD keywords:*\n{kws}")
@@ -422,7 +483,7 @@ async def _run_ats_and_fix(message, context, resume_md: str, pdf_path: str):
         await message.reply_text("\n".join(parts), parse_mode=ParseMode.MARKDOWN)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /start — entry point
+# /start
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -432,7 +493,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saved_pdf, saved_md = get_latest_resume(user_id)
 
     if saved_pdf:
-        # ── Returning user: has saved resume ──
         context.user_data["resume_path"] = str(saved_pdf)
         context.user_data["resume_name"] = saved_pdf.name
         if saved_md:
@@ -440,7 +500,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["resume_text"] = saved_md.read_text(encoding="utf-8")
             except Exception:
                 pass
-
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Use this resume",      callback_data="resume_use_saved")],
             [InlineKeyboardButton("📥 View saved resume",    callback_data="resume_view_saved")],
@@ -454,9 +513,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard,
         )
         return WAITING_RESUME
-
     else:
-        # ── New user: no resume ──
         await update.message.reply_text(
             f"Hi {first_name}! I am your *AI Resume Optimizer* 🤖\n\n"
             "I tailor your resume to job postings, help you find relevant roles, "
@@ -466,9 +523,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_RESUME
 
-
 async def handle_resume_use_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User confirmed to use saved resume — show 3 main options."""
     query = update.callback_query
     await query.answer()
     try:
@@ -478,10 +533,8 @@ async def handle_resume_use_saved(update: Update, context: ContextTypes.DEFAULT_
     await _show_main_menu(query.message, context)
     return WAITING_MAIN_CHOICE
 
-
 async def handle_resume_view_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send saved resume PDF to user, then show main menu."""
-    query   = update.callback_query
+    query = update.callback_query
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=None)
@@ -490,19 +543,14 @@ async def handle_resume_view_saved(update: Update, context: ContextTypes.DEFAULT
     pdf_path = context.user_data.get("resume_path")
     if pdf_path and Path(pdf_path).exists():
         with open(pdf_path, "rb") as f:
-            await query.message.reply_document(
-                document=f,
-                filename=Path(pdf_path).name,
-                caption="Your saved resume 📎",
-            )
+            await query.message.reply_document(document=f, filename=Path(pdf_path).name,
+                                               caption="Your saved resume 📎")
     else:
         await query.message.reply_text("Could not find saved resume file.")
     await _show_main_menu(query.message, context)
     return WAITING_MAIN_CHOICE
 
-
 async def handle_resume_upload_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User wants to upload a new resume."""
     query = update.callback_query
     await query.answer()
     try:
@@ -511,14 +559,10 @@ async def handle_resume_upload_new(update: Update, context: ContextTypes.DEFAULT
         pass
     context.user_data.pop("resume_path", None)
     context.user_data.pop("resume_text", None)
-    await query.message.reply_text(
-        "Please send your new resume PDF or DOCX 👇"
-    )
+    await query.message.reply_text("Please send your new resume PDF or DOCX 👇")
     return WAITING_RESUME
 
-
 async def handle_resume_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User uploads a resume file."""
     doc = update.message.document
     if not doc:
         await update.message.reply_text("Please send a PDF or DOCX file.")
@@ -528,26 +572,20 @@ async def handle_resume_upload(update: Update, context: ContextTypes.DEFAULT_TYP
     if ext not in (".pdf", ".docx", ".doc"):
         await update.message.reply_text("Only PDF or DOCX files are supported.")
         return WAITING_RESUME
-
     await update.message.reply_text("⬇️ Downloading your resume...")
     await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-
     file       = await doc.get_file()
     ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
     local_path = TEMP_DIR / f"{update.effective_user.id}_{ts}{ext}"
     await file.download_to_drive(str(local_path))
-
     context.user_data["resume_path"] = str(local_path)
     context.user_data["resume_name"] = fname
-    context.user_data.pop("resume_text", None)  # clear cached text
-
+    context.user_data.pop("resume_text", None)
     await update.message.reply_text("✅ Resume uploaded!")
     await _show_main_menu(update.message, context)
     return WAITING_MAIN_CHOICE
 
-
 async def _show_main_menu(message, context):
-    """Show the 3 main action buttons."""
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Update My Resume",  callback_data="action_update_resume")],
         [InlineKeyboardButton("🔍 Looking for a Job", callback_data="action_find_job")],
@@ -564,41 +602,34 @@ async def _show_main_menu(message, context):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_action_update_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User chose Update My Resume — analyze current resume and ask for update."""
     query = update.callback_query
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-
-    resume_path = context.user_data.get("resume_path")
+    resume_path = resolve_resume_path(context, query.from_user.id)
     resume_text = context.user_data.get("resume_text", "")
-
     msg = await query.message.reply_text("📄 Analyzing your resume...")
-
-    # Parse resume if not already cached
     if not resume_text:
+        if not resume_path:
+            await msg.edit_text("❌ Resume file not found. Please /start and upload again.")
+            return ConversationHandler.END
         resume_text = parse_resume_with_gemini(resume_path)
         if not resume_text or resume_text.lower().startswith("error"):
             await msg.edit_text(f"Could not parse resume: {resume_text}")
             return ConversationHandler.END
         context.user_data["resume_text"] = resume_text
-
-    # Analyze with FLASH
     try:
         analysis = call_llm(build_resume_analysis_prompt(resume_text), FLASH_MODEL)
     except Exception as e:
         await msg.edit_text(f"Analysis failed: {e}")
         return ConversationHandler.END
-
     quality  = analysis.get("overall_quality", "")
     summary  = analysis.get("summary", "")
     missing  = analysis.get("missing_sections", [])
     weak     = analysis.get("weak_sections", [])
     info_gap = analysis.get("missing_info", [])
-
-    # Build feedback message
     feedback = f"📊 *Resume Analysis*\n\n_{summary}_\n\nQuality: *{quality}*\n"
     if missing:
         feedback += "\n❌ *Missing sections:*\n" + "\n".join(f"  - {s}" for s in missing)
@@ -608,7 +639,6 @@ async def handle_action_update_resume(update: Update, context: ContextTypes.DEFA
             feedback += f"  - *{w['section']}*: {w['issue']}\n"
     if info_gap:
         feedback += "\n\n💡 *Missing info:*\n" + "\n".join(f"  - {s}" for s in info_gap[:4])
-
     await msg.edit_text(feedback, parse_mode=ParseMode.MARKDOWN)
     await query.message.reply_text(
         "Tell me what you'd like to add or change.\n\n"
@@ -619,293 +649,263 @@ async def handle_action_update_resume(update: Update, context: ContextTypes.DEFA
     )
     return WAITING_RESUME_UPDATE
 
-
 async def handle_resume_update_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User sent text update for their resume."""
     user_input = update.message.text.strip()
     return await _process_resume_update(update.message, context, user_input)
 
-
 async def handle_resume_update_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User sent a voice note for resume update."""
+    """Handles voice in WAITING_RESUME_UPDATE and WAITING_UPDATE_CONFIRM states."""
     msg = await update.message.reply_text("🎙️ Transcribing your voice note...")
     voice = update.message.voice
     file  = await voice.get_file()
     ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
     ogg   = TEMP_DIR / f"{update.effective_user.id}_{ts}.ogg"
     await file.download_to_drive(str(ogg))
-
     transcript = await transcribe_voice(str(ogg))
     ogg.unlink(missing_ok=True)
-
+    logger.info(f"Resume update voice transcription: {transcript[:100]}")
     if transcript.startswith("[Transcription failed"):
         await msg.edit_text(f"Could not transcribe voice note.\n{transcript}\n\nPlease type your update instead.")
         return WAITING_RESUME_UPDATE
-
-    await msg.edit_text("Transcribed: " + transcript, parse_mode=ParseMode.MARKDOWN)
+    await msg.edit_text(f"🎙️ Transcribed: _{transcript}_", parse_mode=ParseMode.MARKDOWN)
     return await _process_resume_update(update.message, context, transcript)
 
-
 async def _process_resume_update(message, context, user_input: str):
-    """
-    Correct update route:
-      Step 1 — Flash: merge user input into existing resume (fast, structural)
-      Step 2 — Pro:   full rewrite with proper formatting + template rules
-      Step 3 — PDF:   generate using resume_pdf.py template
-      Step 4 — Save:  store to profile
-      Step 5 — ATS:   ask user (opt-in, same as job optimization path)
-    """
     resume_text = context.user_data.get("resume_text", "")
     if not resume_text:
-        resume_path = context.user_data.get("resume_path")
+        resume_path = resolve_resume_path(context, message.chat.id)
         msg_parse   = await message.reply_text("📄 Parsing your resume...")
+        if not resume_path:
+            await msg_parse.edit_text("❌ Resume file not found. Please /start and upload again.")
+            return WAITING_RESUME_UPDATE
         resume_text = parse_resume_with_gemini(resume_path)
         if not resume_text or resume_text.lower().startswith("error"):
             await msg_parse.edit_text(f"❌ Could not parse resume: {resume_text}")
-            return
+            return WAITING_RESUME_UPDATE
         context.user_data["resume_text"] = resume_text
         await msg_parse.edit_text("✅ Resume parsed.")
-
-    # ── Step 1: Flash merges the update into existing resume ──────────────────
-    msg = await message.reply_text("🔀 Merging your update... (Flash)")
+    msg = await message.reply_text("🔀 Merging your update...")
     try:
-        merge_result = call_llm(build_resume_update_prompt(resume_text, user_input), FLASH_PRO)
+        merge_result  = call_llm(build_resume_update_prompt(resume_text, user_input), FLASH_PRO)
         merged_md     = merge_result.get("optimized_resume_text", "")
         merge_changes = merge_result.get("changes_made", [])
         total_exp     = merge_result.get("total_experience", "")
     except Exception as e:
         await msg.edit_text(f"❌ Merge failed: {e}")
-        return
-
+        return WAITING_RESUME_UPDATE
     if not merged_md:
         await msg.edit_text("❌ Merge returned nothing. Please try again.")
-        return
-
-    # ── Store merged content — show preview before PRO ──────────────────────
+        return WAITING_RESUME_UPDATE
     context.user_data["merged_resume_md"] = merged_md
     context.user_data["total_experience"] = total_exp
     context.user_data["is_update_mode"]   = True
-
-    # Build summary message
     changes_text = "\n".join(f"  • {c}" for c in merge_changes[:4])
     exp_line     = f"\n🗓 *Total experience: {total_exp}*" if total_exp else ""
-
     await msg.edit_text(
         f"✅ *Updates merged!*{exp_line}\n\n*What was added/changed:*\n{changes_text}",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Send preview of merged resume (first 800 chars so Telegram doesn't choke)
     preview = merged_md[:800].strip() + ("\n..." if len(merged_md) > 800 else "")
     await message.reply_text(
         f"*Preview of merged resume:*\n\n```\n{preview}\n```",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Two-button gate — user confirms before PRO model runs
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Looks good — Generate Resume", callback_data="update_confirm_go")],
         [InlineKeyboardButton("✏️ Add more info first",          callback_data="update_confirm_more")],
     ])
     await message.reply_text(
         "Does this look right?\n\n"
-        "_Tap *Add more info* if anything is missing or wrong — "
-        "describe the correction and I'll merge it before rewriting._",
+        "_Tap *Add more info* if anything is missing or wrong._",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=keyboard,
     )
     return WAITING_UPDATE_CONFIRM
 
-# ── Update confirm handlers ──────────────────────────────────────────────────
+# ── Update confirm handlers ───────────────────────────────────────────────────
 
 async def handle_update_confirm_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User confirmed merged content — proceed to PRO rewrite."""
     query = update.callback_query
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-
-    # Move merged_md into resume_text for _run_update_rewrite
     merged_md = context.user_data.get("merged_resume_md", "")
     if not merged_md:
         await query.message.reply_text("❌ Merged content lost. Please /start again.")
         return ConversationHandler.END
-
     context.user_data["resume_text"] = merged_md
     await query.message.reply_text("✍️ Running full rewrite through Pro model — applying REUSE + STAR...")
     return await _run_update_rewrite(query.message, context)
 
-
 async def handle_update_confirm_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User wants to add more info before rewriting."""
     query = update.callback_query
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-
     await query.message.reply_text(
         "What else would you like to add or correct?\n\n"
         "_Type or send a voice note — I'll merge it with what we have so far._",
         parse_mode=ParseMode.MARKDOWN,
     )
-    return WAITING_UPDATE_CONFIRM  # stay in confirm state, accept more text
-
+    return WAITING_UPDATE_CONFIRM
 
 async def handle_update_additional_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User sent additional info while in WAITING_UPDATE_CONFIRM state."""
     additional = update.message.text.strip()
-
-    # Get current merged content and merge the additional info on top
     current_md = context.user_data.get("merged_resume_md", "")
     if not current_md:
         await update.message.reply_text("❌ No resume content found. Please /start again.")
         return ConversationHandler.END
-
     msg = await update.message.reply_text("🔀 Merging additional info...")
     try:
-        merge_result  = call_llm(build_resume_update_prompt(current_md, additional), FLASH_MODEL)
-        updated_md    = merge_result.get("optimized_resume_text", "")
-        new_changes   = merge_result.get("changes_made", [])
-        total_exp     = merge_result.get("total_experience", context.user_data.get("total_experience",""))
+        merge_result = call_llm(build_resume_update_prompt(current_md, additional), FLASH_MODEL)
+        updated_md   = merge_result.get("optimized_resume_text", "")
+        new_changes  = merge_result.get("changes_made", [])
+        total_exp    = merge_result.get("total_experience", context.user_data.get("total_experience",""))
     except Exception as e:
         await msg.edit_text(f"❌ Merge failed: {e}")
         return WAITING_UPDATE_CONFIRM
-
     if not updated_md:
         await msg.edit_text("❌ Merge returned nothing. Please try again.")
         return WAITING_UPDATE_CONFIRM
-
-    # Update stored merged content
     context.user_data["merged_resume_md"] = updated_md
     if total_exp:
         context.user_data["total_experience"] = total_exp
-
     changes_text = "\n".join(f"  • {c}" for c in new_changes[:3])
     exp_line     = f"\n🗓 *Total experience: {total_exp}*" if total_exp else ""
     await msg.edit_text(
         f"✅ *Additional info merged!*{exp_line}\n\n*Changes:*\n{changes_text}",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Show updated preview
     preview = updated_md[:800].strip() + ("\n..." if len(updated_md) > 800 else "")
     await update.message.reply_text(
         f"*Updated preview:*\n\n```\n{preview}\n```",
         parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Show buttons again
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Looks good — Generate Resume", callback_data="update_confirm_go")],
         [InlineKeyboardButton("✏️ Add more info first",          callback_data="update_confirm_more")],
     ])
-    await update.message.reply_text(
-        "Ready to generate?",
-        reply_markup=keyboard,
-    )
+    await update.message.reply_text("Ready to generate?", reply_markup=keyboard)
     return WAITING_UPDATE_CONFIRM
 
+async def handle_update_confirm_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Voice note sent while in WAITING_UPDATE_CONFIRM — merge as additional info."""
+    msg = await update.message.reply_text("🎙️ Transcribing your voice note...")
+    voice = update.message.voice
+    file  = await voice.get_file()
+    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ogg   = TEMP_DIR / f"{update.effective_user.id}_{ts}.ogg"
+    await file.download_to_drive(str(ogg))
+    transcript = await transcribe_voice(str(ogg))
+    ogg.unlink(missing_ok=True)
+    logger.info(f"Update confirm voice transcription: {transcript[:100]}")
+    if transcript.startswith("[Transcription failed"):
+        await msg.edit_text("Could not transcribe. Please type your update instead.")
+        return WAITING_UPDATE_CONFIRM
+    await msg.edit_text(f"🎙️ Transcribed: _{transcript}_", parse_mode=ParseMode.MARKDOWN)
+    current_md = context.user_data.get("merged_resume_md", "")
+    if not current_md:
+        await update.message.reply_text("❌ No resume content found. Please /start again.")
+        return ConversationHandler.END
+    msg2 = await update.message.reply_text("🔀 Merging...")
+    try:
+        merge_result = call_llm(build_resume_update_prompt(current_md, transcript), FLASH_MODEL)
+        updated_md   = merge_result.get("optimized_resume_text", "")
+        new_changes  = merge_result.get("changes_made", [])
+        total_exp    = merge_result.get("total_experience", context.user_data.get("total_experience",""))
+    except Exception as e:
+        await msg2.edit_text(f"❌ Merge failed: {e}")
+        return WAITING_UPDATE_CONFIRM
+    if not updated_md:
+        await msg2.edit_text("❌ Merge returned nothing. Please try again.")
+        return WAITING_UPDATE_CONFIRM
+    context.user_data["merged_resume_md"] = updated_md
+    if total_exp:
+        context.user_data["total_experience"] = total_exp
+    changes_text = "\n".join(f"  • {c}" for c in new_changes[:3])
+    await msg2.edit_text(
+        f"✅ *Merged!*\n\n*Changes:*\n{changes_text}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Looks good — Generate Resume", callback_data="update_confirm_go")],
+        [InlineKeyboardButton("✏️ Add more info first",          callback_data="update_confirm_more")],
+    ])
+    await update.message.reply_text("Ready to generate?", reply_markup=keyboard)
+    return WAITING_UPDATE_CONFIRM
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PATH B — Looking for a Job
 # ═══════════════════════════════════════════════════════════════════════════════
 
-JOB_ROLES = ["Data Scientist", "ML Engineer", "AI Engineer", "Data Analyst",
-             "Data Engineer", "MLOps Engineer"]
-JOB_CITIES = ["Bengaluru", "Hyderabad", "Mumbai", "Delhi", "Chennai", "Pune", "Remote"]
-EXP_LEVELS  = ["0-2 years", "2-5 years", "5-8 years", "8+ years"]
+JOB_ROLES    = ["Data Scientist", "ML Engineer", "AI Engineer", "Data Analyst",
+                "Data Engineer", "MLOps Engineer"]
+JOB_CITIES   = ["Bengaluru", "Hyderabad", "Mumbai", "Delhi", "Chennai", "Pune", "Remote"]
+EXP_LEVELS   = ["0-2 years", "2-5 years", "5-8 years", "8+ years"]
 TIME_FILTERS = {
-    "Last 3 hours":  "r10800",
-    "Last 1 day":    "r86400",
-    "Last 7 days":   "r604800",
+    "Last 3 hours": "r10800",
+    "Last 1 day":   "r86400",
+    "Last 7 days":  "r604800",
 }
 
-
 async def handle_action_find_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User chose Looking for a Job — ask role first."""
     query = update.callback_query
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(r, callback_data=f"jp_role_{r}")]
-        for r in JOB_ROLES
+        [InlineKeyboardButton(r, callback_data=f"jp_role_{r}")] for r in JOB_ROLES
     ])
-    await query.message.reply_text(
-        "*What role are you looking for?*",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
-    )
+    await query.message.reply_text("*What role are you looking for?*",
+                                   parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     return WAITING_JOB_PREFS
 
-
 async def handle_jp_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User picked role — ask city."""
     query = update.callback_query
     await query.answer()
     role  = query.data.replace("jp_role_", "")
     context.user_data["jp_role"] = role
-
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(c, callback_data=f"jp_city_{c}")]
-        for c in JOB_CITIES
+        [InlineKeyboardButton(c, callback_data=f"jp_city_{c}")] for c in JOB_CITIES
     ])
-    await query.edit_message_text(
-        f"*{role}* — Which city?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
-    )
+    await query.edit_message_text(f"*{role}* — Which city?",
+                                  parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     return WAITING_JOB_PREFS
 
-
 async def handle_jp_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User picked city — ask experience."""
     query = update.callback_query
     await query.answer()
     city  = query.data.replace("jp_city_", "")
     context.user_data["jp_city"] = city
-
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(e, callback_data=f"jp_exp_{e}")]
-        for e in EXP_LEVELS
+        [InlineKeyboardButton(e, callback_data=f"jp_exp_{e}")] for e in EXP_LEVELS
     ])
     await query.edit_message_text(
         f"*{context.user_data['jp_role']}* in *{city}* — Your experience level?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
-    )
+        parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     return WAITING_JOB_PREFS
 
-
 async def handle_jp_exp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User picked experience — ask time filter."""
     query = update.callback_query
     await query.answer()
     exp   = query.data.replace("jp_exp_", "")
     context.user_data["jp_exp"] = exp
-
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"jp_time_{label}")]
-        for label in TIME_FILTERS
+        [InlineKeyboardButton(label, callback_data=f"jp_time_{label}")] for label in TIME_FILTERS
     ])
     await query.edit_message_text(
         f"*{context.user_data['jp_role']}* · *{context.user_data['jp_city']}* · *{exp}*\n\n"
         "How recent should the postings be?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard,
-    )
+        parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     return WAITING_JOB_TIME
 
-
 async def handle_jp_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User picked time filter — fetch + rank jobs."""
     query       = update.callback_query
     await query.answer()
     time_label  = query.data.replace("jp_time_", "")
@@ -914,75 +914,48 @@ async def handle_jp_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city        = context.user_data.get("jp_city", "Bengaluru")
     exp         = context.user_data.get("jp_exp", "")
     resume_text = context.user_data.get("resume_text", "")
-
     await query.edit_message_text(
         f"Searching *{role}* in *{city}* ({time_label.lower()})...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    # Fetch jobs
+        parse_mode=ParseMode.MARKDOWN)
     try:
-        # Map city to LinkedIn geo ID
-        CITY_GEO = {
-            "Bengaluru": "105214831", "Hyderabad": "113968072",
-            "Mumbai": "102713980",    "Delhi": "102713980",
-            "Chennai": "112565523",   "Pune": "115785029",
-            "Remote": "102713980",
-        }
-        # Use keyword search with city in keywords if not Bengaluru
-        kw = f"{role} {exp}" if city == "Bengaluru" else f"{role} {city}"
+        kw   = f"{role} {exp}" if city == "Bengaluru" else f"{role} {city}"
         jobs = fetch_jobs(keywords=kw, time_filter=time_filter, max_jobs=15, big_only=True)
         if not jobs:
             jobs = fetch_jobs(keywords=kw, time_filter=time_filter, max_jobs=15, big_only=False)
     except Exception as e:
         await query.message.reply_text(f"Could not fetch jobs: {e}")
         return ConversationHandler.END
-
     if not jobs:
         await query.message.reply_text(
             "No jobs found for that filter.\n\nTry a wider time range.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Try last 7 days", callback_data="jp_time_Last 7 days")
-            ]])
-        )
+            ]]))
         return WAITING_JOB_TIME
-
-    await query.message.reply_text(
-        f"Found {len(jobs)} jobs. Analyzing against your resume... 🤖"
-    )
-
-    # Rank with FLASH
+    await query.message.reply_text(f"Found {len(jobs)} jobs. Analyzing against your resume... 🤖")
     job_dicts = [{"title": j.title, "company": j.company, "url": j.url, "job_id": j.job_id or str(i)}
                  for i, j in enumerate(jobs)]
-    ranked = job_dicts  # default: unranked
-
+    ranked = job_dicts
     if resume_text:
         try:
             rank_result = call_llm(build_job_ranking_prompt(job_dicts, resume_text), FLASH_MODEL)
             ranked = rank_result.get("ranked_jobs", job_dicts)
         except Exception as e:
             logger.warning(f"Job ranking failed: {e}")
-
-    # Display ranked results
     await query.message.reply_text(
         f"*{role} — {city} — {time_label}*\n_{len(ranked)} jobs ranked by match_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
+        parse_mode=ParseMode.MARKDOWN)
     job_map = {}
     for i, job in enumerate(ranked[:10], 1):
-        jid     = job.get("job_id") or str(i)
-        url     = job.get("url", "")
-        score   = job.get("match_score", "")
-        reason  = job.get("reason", "")
-        company = job.get("company", "")
-        title   = job.get("title", "")
-
+        jid       = job.get("job_id") or str(i)
+        url       = job.get("url", "")
+        score     = job.get("match_score", "")
+        reason    = job.get("reason", "")
+        company   = job.get("company", "")
+        title     = job.get("title", "")
         score_line = f"🎯 *{score}% match* — {reason}" if score else ""
         clean_url  = url.split("?")[0] if url else ""
-
         job_map[jid] = {"url": clean_url, "title": title, "company": company}
-
         await query.message.reply_text(
             f"*{i}. {title}*\n{company}\n{score_line}\n{clean_url}",
             parse_mode=ParseMode.MARKDOWN,
@@ -991,19 +964,15 @@ async def handle_jp_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]]),
             disable_web_page_preview=True,
         )
-
     context.user_data["job_map"] = job_map
-    await query.message.reply_text(
-        "Tap *Optimize my resume for this* on any job above.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await query.message.reply_text("Tap *Optimize my resume for this* on any job above.",
+                                   parse_mode=ParseMode.MARKDOWN)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PATH C — Job Link
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_action_job_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User chose I Have a Job Link."""
     query = update.callback_query
     await query.answer()
     try:
@@ -1013,54 +982,40 @@ async def handle_action_job_link(update: Update, context: ContextTypes.DEFAULT_T
     await query.message.reply_text(
         "Please paste the job posting URL 👇\n\n"
         "_If the URL doesn't work, you can also paste the job description as text._",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        parse_mode=ParseMode.MARKDOWN)
     return WAITING_JOB_URL
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# OPTIMIZATION PIPELINE (all 3 paths converge here)
+# OPTIMIZATION PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_job_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User pastes job URL — scrape and start pipeline."""
     url = update.message.text.strip()
     if not url.startswith("http"):
         await update.message.reply_text("That doesn't look like a URL. Send the full https:// link.")
         return WAITING_JOB_URL
-
     context.user_data["job_url"] = url
     msg = await update.message.reply_text("🌐 Scraping job description...")
     await update.message.chat.send_action(ChatAction.TYPING)
-
     jd = scrape_url_content(url)
     if not jd:
-        await msg.edit_text(
-            "❌ Couldn't scrape that URL.\n\n"
-            "💡 Paste the job description text directly instead."
-        )
+        await msg.edit_text("❌ Couldn't scrape that URL.\n\n💡 Paste the job description text directly instead.")
         context.user_data["waiting_for_manual_jd"] = True
         return WAITING_JOB_URL
-
     context.user_data["job_description"] = jd
     return await _run_analysis(update.message, msg, context)
 
-
 async def handle_text_in_url_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Text in URL state — could be URL, JD text, or gibberish."""
     text = update.message.text.strip()
     if text.startswith("http"):
         return await handle_job_url(update, context)
     elif context.user_data.get("waiting_for_manual_jd") or len(text) > 200:
         return await handle_manual_jd(update, context)
     else:
-        await update.message.reply_text(
-            "Send the job URL (https://...) or paste the full job description."
-        )
+        await update.message.reply_text("Send the job URL (https://...) or paste the full job description.")
         return WAITING_JOB_URL
 
-
 async def handle_manual_jd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User pasted JD as text."""
     if not context.user_data.get("waiting_for_manual_jd"):
         return await handle_job_url(update, context)
     text = update.message.text.strip()
@@ -1072,22 +1027,19 @@ async def handle_manual_jd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("✅ Got the job description!")
     return await _run_analysis(update.message, msg, context)
 
-
 async def _run_analysis(message, status_msg, context):
-    """Parse resume + analyze match. FLASH model."""
-    # Parse resume
     await status_msg.edit_text("📄 Parsing your resume...")
-    resume_path = context.user_data.get("resume_path")
+    resume_path = resolve_resume_path(context, message.chat.id)
     resume_text = context.user_data.get("resume_text", "")
-
     if not resume_text:
+        if not resume_path:
+            await status_msg.edit_text("❌ Resume file not found. Please /start and upload again.")
+            return ConversationHandler.END
         resume_text = parse_resume_with_gemini(resume_path)
         if not resume_text or resume_text.lower().startswith("error"):
             await status_msg.edit_text(f"❌ Failed to parse resume: {resume_text}")
             return ConversationHandler.END
         context.user_data["resume_text"] = resume_text
-
-    # Analyze — FLASH
     jd = context.user_data.get("job_description", "")
     await status_msg.edit_text("🔍 Analyzing match...")
     try:
@@ -1095,15 +1047,11 @@ async def _run_analysis(message, status_msg, context):
     except Exception as e:
         await status_msg.edit_text(f"❌ Analysis failed: {e}")
         return ConversationHandler.END
-
     score       = analysis.get("score", 0)
     match_level = analysis.get("match_level", "Unknown")
     context.user_data["analysis"] = analysis
     context.user_data["score"]    = score
-
     await status_msg.edit_text(fmt_analysis(analysis, score, match_level), parse_mode=ParseMode.MARKDOWN)
-
-    # Low score → roadmap
     if score < REWRITE_THRESHOLD:
         await message.reply_text("⏳ Generating improvement roadmap...")
         try:
@@ -1113,43 +1061,32 @@ async def _run_analysis(message, status_msg, context):
             return ConversationHandler.END
         await message.reply_text(fmt_roadmap(guidance), parse_mode=ParseMode.MARKDOWN)
         await message.reply_text(
-            "━━━━━━━━━━━━━━━━\n*What next?*\n\n"
-            "🔄 /new — Try a different job\n🔍 /start — Back to main menu",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+            "*What next?*\n\n🔄 /new — Try a different job\n🔍 /start — Back to main menu",
+            parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
-
-    # Clarifying questions — FLASH
     await message.reply_text("⏳ Preparing questions...")
     try:
         q_result = call_llm(build_clarifying_questions_prompt(jd, resume_text, analysis), FLASH_MODEL)
     except Exception:
         q_result = {"should_ask": False, "questions": []}
-
     questions  = q_result.get("questions", [])
     should_ask = q_result.get("should_ask", False) and len(questions) > 0
-
     if should_ask:
         context.user_data["questions"]      = questions
         context.user_data["current_q_idx"]  = 0
         context.user_data["clarifications"] = {}
         first_q = questions[0]["question"]
-        context.user_data["last_question"] = first_q
+        context.user_data["last_question"]  = first_q
         skip_btn = InlineKeyboardMarkup([[
             InlineKeyboardButton("Skip this question", callback_data="skip_question")
         ]])
         await message.reply_text(
             f"Quick question (1/{len(questions)}):\n\n*{first_q}*\n\n_Answer honestly._",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=skip_btn,
-        )
+            parse_mode=ParseMode.MARKDOWN, reply_markup=skip_btn)
         return WAITING_CLARIFICATION
-
     return await _ask_extra_skills_msg(message, context)
 
-
-async def handle_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    answer         = update.message.text.strip()
+async def _process_clarification(message, context, answer: str):
     questions      = context.user_data.get("questions", [])
     current_idx    = context.user_data.get("current_q_idx", 0)
     clarifications = context.user_data.get("clarifications", {})
@@ -1163,13 +1100,32 @@ async def handle_clarification(update: Update, context: ContextTypes.DEFAULT_TYP
         next_q = questions[next_idx]["question"]
         context.user_data["last_question"] = next_q
         skip_btn = InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="skip_question")]])
-        await update.message.reply_text(
+        await message.reply_text(
             f"Question ({next_idx+1}/{len(questions)}):\n\n*{next_q}*",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=skip_btn,
-        )
+            parse_mode=ParseMode.MARKDOWN, reply_markup=skip_btn)
         return WAITING_CLARIFICATION
-    return await _ask_extra_skills_msg(update.message, context)
+    return await _ask_extra_skills_msg(message, context)
 
+async def handle_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip() if update.message.text else ""
+    return await _process_clarification(update.message, context, answer)
+
+async def handle_clarification_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Voice note answer to a clarifying question."""
+    msg   = await update.message.reply_text("🎙️ Transcribing...")
+    voice = update.message.voice
+    file  = await voice.get_file()
+    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ogg   = TEMP_DIR / f"{update.effective_user.id}_{ts}.ogg"
+    await file.download_to_drive(str(ogg))
+    transcript = await transcribe_voice(str(ogg))
+    ogg.unlink(missing_ok=True)
+    logger.info(f"Clarification voice transcription: {transcript[:100]}")
+    if transcript.startswith("[Transcription failed"):
+        await msg.edit_text("Could not transcribe. Please type your answer instead.")
+        return WAITING_CLARIFICATION
+    await msg.edit_text(f"🎙️ Transcribed: _{transcript}_", parse_mode=ParseMode.MARKDOWN)
+    return await _process_clarification(update.message, context, transcript)  # ← fixed: return added
 
 async def handle_skip_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query       = update.callback_query
@@ -1188,40 +1144,11 @@ async def handle_skip_question(update: Update, context: ContextTypes.DEFAULT_TYP
         skip_btn = InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="skip_question")]])
         await query.message.reply_text(
             f"Question ({next_idx+1}/{len(questions)}):\n\n*{next_q}*",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=skip_btn,
-        )
+            parse_mode=ParseMode.MARKDOWN, reply_markup=skip_btn)
         return WAITING_CLARIFICATION
-    # All questions done — proceed to skills check
-    # Works both inside and outside ConversationHandler
-    await _ask_extra_skills_msg(query.message, context)
-    return WAITING_SKILLS_INPUT
-
-
-async def handle_clarification_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User sent a voice note as answer to a clarifying question."""
-    msg   = await update.message.reply_text("🎙️ Transcribing...")
-    voice = update.message.voice
-    file  = await voice.get_file()
-    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ogg   = TEMP_DIR / f"{update.effective_user.id}_{ts}.ogg"
-    await file.download_to_drive(str(ogg))
-
-    transcript = await transcribe_voice(str(ogg))
-    ogg.unlink(missing_ok=True)
-
-    if transcript.startswith("[Transcription failed"):
-        await msg.edit_text(f"Could not transcribe. Please type your answer instead.")
-        return WAITING_CLARIFICATION
-
-    await msg.edit_text("Transcribed: " + transcript)
-
-    # Inject transcript as text and reuse handle_clarification
-    update.message.text = transcript
-    return await handle_clarification(update, context)
-
+    return await _ask_extra_skills_msg(query.message, context)
 
 async def _ask_extra_skills_msg(message, context):
-    """Ask about missing skills — takes message directly."""
     analysis    = context.user_data.get("analysis") or {}
     all_missing = (analysis.get("missing_critical",[]) + analysis.get("missing_preferred",[]))[:6]
     if not all_missing:
@@ -1235,10 +1162,8 @@ async def _ask_extra_skills_msg(message, context):
         f"*One last check* — in JD but not your resume:\n\n{skills_text}\n\n"
         "Have any of these? Type comma-separated, or tap below.\n"
         "_Example: Spark, A/B testing, dbt_",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=none_btn,
-    )
+        parse_mode=ParseMode.MARKDOWN, reply_markup=none_btn)
     return WAITING_SKILLS_INPUT
-
 
 async def handle_skills_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.message.text.strip()
@@ -1250,7 +1175,6 @@ async def handle_skills_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"✅ Adding: *{', '.join(extra)}*", parse_mode=ParseMode.MARKDOWN)
     return await _run_rewrite(update.message, context)
 
-
 async def handle_no_extra_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1259,185 +1183,146 @@ async def handle_no_extra_skills(update: Update, context: ContextTypes.DEFAULT_T
     except Exception:
         pass
     context.user_data["extra_skills"] = []
-    # Works both inside and outside ConversationHandler
-    await _run_rewrite(query.message, context)
-    return WAITING_ATS_CONFIRM
-
+    return await _run_rewrite(query.message, context)
 
 async def _run_update_rewrite(message, context):
-    """
-    Dedicated rewrite for the update path — no JD, uses build_update_rewrite_prompt.
-    Applies REUSE + STAR + experience calculation via PRO model.
-    Then generates PDF, saves to profile, asks about ATS.
-    """
+    user_id = message.chat.id
+    if not await _check_limit_and_gate(message, user_id):
+        return WAITING_ATS_CONFIRM
     merged_text = context.user_data.get("resume_text", "")
     if not merged_text:
         await message.reply_text("❌ No resume text found. Please try /start again.")
         return ConversationHandler.END
-
     msg = await message.reply_text("✍️ Rewriting with REUSE + STAR... ~30 seconds.")
     await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-
     try:
-        # PRO MODEL — full impact rewrite
         total_exp = context.user_data.get("total_experience", "")
-        rewrite = call_llm(build_update_rewrite_prompt(merged_text, total_exp), PRO_MODEL)
+        rewrite   = call_llm(build_update_rewrite_prompt(merged_text, total_exp), PRO_MODEL)
     except Exception as e:
         await msg.edit_text(f"❌ Rewrite failed: {e}")
         return ConversationHandler.END
-
     resume_md = rewrite.get("optimized_resume_text", "")
     changes   = rewrite.get("changes_made", [])
     total_exp = context.user_data.get("total_experience", "")
-
     if not resume_md:
         await msg.edit_text("❌ No resume returned. Please try /start again.")
         return ConversationHandler.END
-
+    cleanup_output_dir()
     await msg.edit_text("📄 Generating PDF...")
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     pdf_path = str(OUTPUT_DIR / f"{message.chat.id}_{ts}_updated.pdf")
-
     try:
         generate_resume_pdf(resume_md, pdf_path)
     except Exception as e:
         await msg.edit_text(f"⚠️ PDF failed: {e}")
         return ConversationHandler.END
-
-    # Summary — clean, no ATS score (user will run that separately)
     changes_text = "\n".join(f"  • {c}" for c in changes[:4])
     exp_line     = f"\n🗓 *Total experience: {total_exp}*" if total_exp else ""
-    summary = (
-        f"✅ *Resume Updated & Ready!*{exp_line}\n\n"
-        f"📝 *Writing improvements:*\n{changes_text}"
-    )
-    await msg.edit_text(summary, parse_mode=ParseMode.MARKDOWN)
-
+    await msg.edit_text(
+        f"✅ *Resume Updated & Ready!*{exp_line}\n\n📝 *Writing improvements:*\n{changes_text}",
+        parse_mode=ParseMode.MARKDOWN)
     with open(pdf_path, "rb") as f:
-        await message.reply_document(
-            document=f,
-            filename=f"updated_resume_{ts}.pdf",
-            caption="📎 Your updated resume",
-        )
-
-    # Save to profile
+        await message.reply_document(document=f, filename=f"updated_resume_{ts}.pdf",
+                                     caption="📎 Your updated resume")
     try:
         saved = save_resume_for_user(message.chat.id, pdf_path, resume_md)
-        context.user_data["resume_path"]  = str(saved)
-        context.user_data["resume_text"]  = resume_md
-        context.user_data["last_pdf_path"] = str(saved)
+        context.user_data["resume_path"]    = str(saved)
+        context.user_data["resume_text"]    = resume_md
+        context.user_data["last_pdf_path"]  = str(saved)
         context.user_data["last_resume_md"] = resume_md
         logger.info(f"Saved updated resume: {saved}")
     except Exception as e:
         logger.warning(f"Profile save failed: {e}")
-
-    # ATS opt-in — same as job path
+    access    = increment_use(message.chat.id)
+    remaining = FREE_LIMIT - access.get("uses", 0)
+    if not access.get("unlocked") and remaining > 0:
+        await message.reply_text(f"_You have {remaining} free generation(s) remaining._",
+                                 parse_mode=ParseMode.MARKDOWN)
     ats_btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes, run ATS check",  callback_data="ats_yes")],
-        [InlineKeyboardButton("⏭️ Skip for now",        callback_data="ats_skip")],
+        [InlineKeyboardButton("✅ Yes, run ATS check", callback_data="ats_yes")],
+        [InlineKeyboardButton("⏭️ Skip for now",       callback_data="ats_skip")],
     ])
     await message.reply_text(
         "Would you like to run an ATS check on the updated resume?\n\n"
         "_Checks parse rate, keywords, formatting. Auto-fixes issues if found._\n\n"
         "⏱ Takes about 2-3 minutes.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ats_btn,
-    )
+        parse_mode=ParseMode.MARKDOWN, reply_markup=ats_btn)
     return WAITING_ATS_CONFIRM
 
-
 async def _run_rewrite(message, context):
-    """Run rewrite with PRO model → generate PDF → ask about ATS."""
+    user_id = message.chat.id
+    if not await _check_limit_and_gate(message, user_id):
+        return WAITING_ATS_CONFIRM
     jd             = context.user_data.get("job_description","")
     resume_text    = context.user_data.get("resume_text","")
     analysis       = context.user_data.get("analysis",{})
     clarifications = context.user_data.get("clarifications",{})
     extra_skills   = context.user_data.get("extra_skills",[])
     score          = context.user_data.get("score",0)
-
     msg = await message.reply_text("✍️ Rewriting your resume... ~30 seconds.")
     await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-
     try:
-        # PRO MODEL for rewrite only
         rewrite = call_llm(
             build_rewrite_with_context_prompt(jd, resume_text, analysis, clarifications, extra_skills),
-            PRO_MODEL,
-        )
+            PRO_MODEL)
     except Exception as e:
         await msg.edit_text(f"❌ Rewrite failed: {e}")
         return ConversationHandler.END
-
     resume_md  = rewrite.get("optimized_resume_text","")
     changes    = rewrite.get("changes_made",[])
     est_score  = rewrite.get("final_score_estimate","?")
     cover_hook = rewrite.get("cover_letter_hook","")
-
     if not resume_md:
         await msg.edit_text("❌ No resume returned. Try /start")
         return ConversationHandler.END
-
+    cleanup_output_dir()
     await msg.edit_text("📄 Generating PDF...")
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     pdf_path = str(OUTPUT_DIR / f"{message.chat.id}_{ts}_tailored.pdf")
-
     try:
         generate_resume_pdf(resume_md, pdf_path)
     except Exception as e:
         await msg.edit_text(f"⚠️ PDF failed: {e}")
         await message.reply_text(f"```\n{resume_md[:3000]}\n```", parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
-
-    # Summary — different messaging for update mode vs job optimization
-    changes_text  = "\n".join(f"  • {c}" for c in changes[:4])
-    is_update     = context.user_data.get("is_update_mode", False)
-
+    changes_text = "\n".join(f"  • {c}" for c in changes[:4])
+    is_update    = context.user_data.get("is_update_mode", False)
     if is_update:
-        summary = (
-            f"✅ *Resume Updated & Formatted!*\n\n"
-            f"📝 *Changes applied:*\n{changes_text}\n"
-        )
+        summary = f"✅ *Resume Updated & Formatted!*\n\n📝 *Changes applied:*\n{changes_text}\n"
     else:
-        summary = (
-            f"✅ *Resume Tailored!*\n\n"
-            f"Score: *{score}/100* → *{est_score}/100* (estimated)\n\n"
-            f"📝 *Key changes:*\n{changes_text}\n"
-        )
+        summary = (f"✅ *Resume Tailored!*\n\nScore: *{score}/100* → *{est_score}/100* (estimated)\n\n"
+                   f"📝 *Key changes:*\n{changes_text}\n")
         if cover_hook:
             summary += f"\n✉️ *Cover letter opener:*\n_{cover_hook}_"
     await msg.edit_text(summary, parse_mode=ParseMode.MARKDOWN)
-
     with open(pdf_path,"rb") as f:
         await message.reply_document(document=f, filename=f"tailored_resume_{ts}.pdf",
                                      caption="📎 Your ATS-optimized tailored resume")
-
-    # Save to profile
     try:
         saved = save_resume_for_user(message.chat.id, pdf_path, resume_md)
-        context.user_data["last_pdf_path"] = str(saved)
+        context.user_data["last_pdf_path"]  = str(saved)
         context.user_data["last_resume_md"] = resume_md
         logger.info(f"Saved: {saved}")
     except Exception as e:
         logger.warning(f"Profile save failed: {e}")
-
-    # Ask about ATS — don't run automatically
+    access    = increment_use(message.chat.id)
+    remaining = FREE_LIMIT - access.get("uses", 0)
+    if not access.get("unlocked") and remaining > 0:
+        await message.reply_text(f"_You have {remaining} free generation(s) remaining._",
+                                 parse_mode=ParseMode.MARKDOWN)
     ats_btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes, run ATS check",  callback_data="ats_yes")],
-        [InlineKeyboardButton("⏭️ Skip for now",        callback_data="ats_skip")],
+        [InlineKeyboardButton("✅ Yes, run ATS check", callback_data="ats_yes")],
+        [InlineKeyboardButton("⏭️ Skip for now",       callback_data="ats_skip")],
     ])
     await message.reply_text(
         "Would you like to run an ATS check?\n\n"
         "_This analyzes parse rate, keyword coverage, and formatting. "
         "If issues are found, I'll auto-fix and send a v2._\n\n"
         "⏱ Takes about 2-3 minutes.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ats_btn,
-    )
+        parse_mode=ParseMode.MARKDOWN, reply_markup=ats_btn)
     return WAITING_ATS_CONFIRM
 
-
 async def handle_ats_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User said yes to ATS check."""
     query = update.callback_query
     await query.answer()
     try:
@@ -1454,9 +1339,7 @@ async def handle_ats_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def handle_ats_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User skipped ATS check."""
     query = update.callback_query
     await query.answer()
     try:
@@ -1468,20 +1351,15 @@ async def handle_ats_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def _show_final_next_steps(message):
     await message.reply_text(
-        "━━━━━━━━━━━━━━━━\n*What next?*\n\n"
-        "🚀 /start — Back to main menu\n"
-        "📥 /my_resume — Download saved resumes\n"
-        "❓ /help — See all commands",
-        parse_mode=ParseMode.MARKDOWN,
+        "What next?\n\n"
+        "/start — Back to main menu\n"
+        "/my_resume — Download saved resumes\n"
+        "/help — See all commands",
     )
 
-# ── Optimize from job listing tap ─────────────────────────────────────────────
-
 async def handle_optimize_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User tapped Optimize on a job card — go straight to scrape + pipeline."""
     query = update.callback_query
     await query.answer()
     jid   = query.data.replace("optimize_","")
@@ -1496,12 +1374,11 @@ async def handle_optimize_job(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-    context.user_data["job_url"] = url
+    context.user_data["job_url"]      = url
     context.user_data["selected_job"] = job
     context.user_data.pop("job_description", None)
     await query.message.reply_text(
-        f"Optimizing for:\n*{title}* at *{company}*", parse_mode=ParseMode.MARKDOWN
-    )
+        f"Optimizing for:\n*{title}* at *{company}*", parse_mode=ParseMode.MARKDOWN)
     chat_msg = await query.message.reply_text("🌐 Scraping job description...")
     jd = scrape_url_content(url)
     if not jd:
@@ -1518,9 +1395,7 @@ async def cmd_my_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     resumes = list_user_resumes(user_id)
     if not resumes:
-        await message.reply_text(
-            "No saved resumes yet.\n\nUse /start to optimize a resume — it's saved automatically."
-        )
+        await message.reply_text("No saved resumes yet.\n\nUse /start to optimize a resume — it's saved automatically.")
         return
     if len(resumes) == 1:
         with open(resumes[0],"rb") as f:
@@ -1532,16 +1407,11 @@ async def cmd_my_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = pdf.stem.split("_")
         ver   = parts[1] if len(parts) > 1 else f"v{i}"
         date  = parts[2][:8] if len(parts) > 2 else ""
-        keyboard.append([InlineKeyboardButton(
-            f"📄 {ver} — {date}", callback_data=f"dl_resume_{pdf.name}"
-        )])
+        keyboard.append([InlineKeyboardButton(f"📄 {ver} — {date}", callback_data=f"dl_resume_{pdf.name}")])
     keyboard.append([InlineKeyboardButton("📥 Download Latest", callback_data=f"dl_resume_{resumes[0].name}")])
-    await message.reply_text(
-        f"*Your Saved Resumes* ({len(resumes)} versions)",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
+    await message.reply_text(f"*Your Saved Resumes* ({len(resumes)} versions)",
+                             parse_mode=ParseMode.MARKDOWN,
+                             reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_download_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query    = update.callback_query
@@ -1556,8 +1426,7 @@ async def handle_download_resume(update: Update, context: ContextTypes.DEFAULT_T
     except Exception:
         pass
     with open(pdf_path,"rb") as f:
-        await query.message.reply_document(document=f, filename=filename,
-                                           caption=f"📎 {filename}")
+        await query.message.reply_document(document=f, filename=filename, caption=f"📎 {filename}")
 
 # ── Misc commands ─────────────────────────────────────────────────────────────
 
@@ -1566,10 +1435,9 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Starting fresh! Send /start to begin.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "━━━━━━━━━━━━━━━━\n*AI Resume Optimizer — Help*\n━━━━━━━━━━━━━━━━\n\n"
+        "*AI Resume Optimizer — Help*\n\n"
         "*Flow:*\n"
         "1 /start → upload or use saved resume\n"
         "2 Choose: Update Resume / Find Job / Job Link\n"
@@ -1585,10 +1453,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Gemini Pro → resume rewrite only\n"
         "• Gemini Flash-lite → everything else\n\n"
         "*Voice notes:*\n"
-        "• Send a voice note in the Update Resume path — I transcribe automatically",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
+        "• Supported in all input steps — just send a voice note!",
+        parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -1596,49 +1462,43 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-
 async def handle_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-    # Never respond to voice notes — they are handled in conversation states
     if update.message.voice:
+        # Voice outside conversation states — give helpful message instead of silent drop
+        await update.message.reply_text(
+            "I received your voice note, but I'm not sure what you'd like to do.\n\n"
+            "Use /start to begin, then send your voice note when prompted."
+        )
         return
+    text = update.message.text.strip() if update.message.text else ""
+    if text and not text.startswith("/"):
+        user_id = update.effective_user.id
+        if not is_allowed(user_id):
+            await handle_access_key(update, context)
+            return
     has_resume = bool(context.user_data.get("resume_path") or context.user_data.get("resume_text"))
     if has_resume:
-        await update.message.reply_text(
-            "Not sure what to do with that.\n\nUse /start to see the main menu.",
-        )
+        await update.message.reply_text("Not sure what to do with that.\n\nUse /start to see the main menu.")
     else:
-        await update.message.reply_text(
-            "Send /start to begin.\n\nI need your resume first.",
-        )
-
+        await update.message.reply_text("Send /start to begin.\n\nI need your resume first.")
 
 async def handle_wrong_in_resume_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
     if text.startswith("http"):
         await update.message.reply_text(
             "That looks like a job URL — but I need your *resume file first*.\n\nAttach a PDF or DOCX.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+            parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text("Please attach your resume as a PDF or DOCX file.")
     return WAITING_RESUME
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def resolve_resume_path(context, user_id):
-    resume_path = context.user_data.get("resume_path", "")
-    
-    if resume_path and Path(resume_path).exists():
-        return resume_path          # ← file exists, use it
-    
-    # File gone — fall back to profile
-    saved_pdf, _ = get_latest_resume(user_id)
-    if saved_pdf and saved_pdf.exists():
-        context.user_data["resume_path"] = str(saved_pdf)  # update context
-        return str(saved_pdf)       # ← use profile version instead
-    
-    return None                     # ← nothing found, show error
+async def handle_expired_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer(
+        "This session has expired. Please type /start to begin a new one.",
+        show_alert=True)
+
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         ("start",      "Main menu — optimize, find jobs, update resume"),
@@ -1649,11 +1509,44 @@ async def post_init(app: Application):
     ])
     logger.info("Bot commands registered.")
 
-
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # ── Smart state migration: reset only users stuck in invalid states ────────
+    # This runs on startup and fixes corrupted/stale per-user conversation states
+    # WITHOUT wiping the entire pickle (which would log everyone out)
+    pickle_file = Path("resume_bot_state.pickle")
+    VALID_STATES = set(range(10))  # 0-9 match our conversation state constants
+
+    if pickle_file.exists():
+        try:
+            import pickle
+            with open(pickle_file, "rb") as f:
+                data = pickle.load(f)
+
+            changed = False
+            # PicklePersistence stores conversations under key "conversations"
+            # Format: {conv_name: {(chat_id, user_id): state_int}}
+            conversations = data.get("conversations", {})
+            for conv_name, conv_data in conversations.items():
+                for key, state in list(conv_data.items()):
+                    if state not in VALID_STATES and state is not None:
+                        logger.warning(f"Resetting invalid state {state} for {key}")
+                        conv_data[key] = None  # None = outside conversation
+                        changed = True
+
+            if changed:
+                with open(pickle_file, "wb") as f:
+                    pickle.dump(data, f)
+                logger.info("Fixed stale conversation states in pickle.")
+        except Exception as e:
+            logger.warning(f"Could not migrate pickle, deleting it: {e}")
+            pickle_file.unlink(missing_ok=True)
+
+    persistence = PicklePersistence(filepath="resume_bot_state.pickle")
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
     conv = ConversationHandler(
+        name="resume_conv",
+        persistent=True,
         per_message=False,
         entry_points=[
             CommandHandler("start",  cmd_start),
@@ -1662,9 +1555,9 @@ def main():
         ],
         states={
             WAITING_RESUME: [
-                CallbackQueryHandler(handle_resume_use_saved,   pattern="^resume_use_saved$"),
-                CallbackQueryHandler(handle_resume_view_saved,  pattern="^resume_view_saved$"),
-                CallbackQueryHandler(handle_resume_upload_new,  pattern="^resume_upload_new$"),
+                CallbackQueryHandler(handle_resume_use_saved,  pattern="^resume_use_saved$"),
+                CallbackQueryHandler(handle_resume_view_saved, pattern="^resume_view_saved$"),
+                CallbackQueryHandler(handle_resume_upload_new, pattern="^resume_upload_new$"),
                 CommandHandler("help",      cmd_help),
                 CommandHandler("cancel",    cmd_cancel),
                 CommandHandler("my_resume", cmd_my_resume),
@@ -1681,8 +1574,8 @@ def main():
                 CommandHandler("my_resume", cmd_my_resume),
             ],
             WAITING_RESUME_UPDATE: [
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
                 MessageHandler(filters.VOICE, handle_resume_update_voice),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_resume_update_text),
             ],
@@ -1690,54 +1583,54 @@ def main():
                 CallbackQueryHandler(handle_jp_role, pattern="^jp_role_"),
                 CallbackQueryHandler(handle_jp_city, pattern="^jp_city_"),
                 CallbackQueryHandler(handle_jp_exp,  pattern="^jp_exp_"),
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
             ],
             WAITING_JOB_TIME: [
                 CallbackQueryHandler(handle_jp_time, pattern="^jp_time_"),
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
             ],
             WAITING_JOB_URL: [
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
                 MessageHandler(filters.Document.ALL, handle_resume_upload),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_in_url_state),
             ],
             WAITING_CLARIFICATION: [
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
                 CallbackQueryHandler(handle_skip_question, pattern="^skip_question$"),
                 MessageHandler(filters.VOICE, handle_clarification_voice),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_clarification),
             ],
             WAITING_SKILLS_INPUT: [
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
                 CallbackQueryHandler(handle_no_extra_skills, pattern="^no_extra_skills$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_skills_input),
             ],
             WAITING_UPDATE_CONFIRM: [
                 CallbackQueryHandler(handle_update_confirm_go,   pattern="^update_confirm_go$"),
                 CallbackQueryHandler(handle_update_confirm_more, pattern="^update_confirm_more$"),
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
-                MessageHandler(filters.VOICE, handle_resume_update_voice),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
+                MessageHandler(filters.VOICE, handle_update_confirm_voice),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update_additional_text),
             ],
             WAITING_ATS_CONFIRM: [
                 CallbackQueryHandler(handle_ats_yes,  pattern="^ats_yes$"),
                 CallbackQueryHandler(handle_ats_skip, pattern="^ats_skip$"),
-                CommandHandler("cancel",    cmd_cancel),
-                CommandHandler("help",      cmd_help),
+                CommandHandler("cancel", cmd_cancel),
+                CommandHandler("help",   cmd_help),
             ],
         },
         fallbacks=[
-            CommandHandler("start",      cmd_start),
-            CommandHandler("new",        cmd_new),
-            CommandHandler("cancel",     cmd_cancel),
-            CommandHandler("help",       cmd_help),
-            CommandHandler("my_resume",  cmd_my_resume),
+            CommandHandler("start",     cmd_start),
+            CommandHandler("new",       cmd_new),
+            CommandHandler("cancel",    cmd_cancel),
+            CommandHandler("help",      cmd_help),
+            CommandHandler("my_resume", cmd_my_resume),
         ],
     )
 
@@ -1746,32 +1639,27 @@ def main():
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(CommandHandler("my_resume", cmd_my_resume))
     app.add_handler(CallbackQueryHandler(handle_download_resume,      pattern="^dl_resume_"))
-    app.add_handler(CallbackQueryHandler(handle_update_confirm_go,   pattern="^update_confirm_go$"))
-    app.add_handler(CallbackQueryHandler(handle_update_confirm_more, pattern="^update_confirm_more$"))
-    app.add_handler(CallbackQueryHandler(handle_skip_question,       pattern="^skip_question$"))
-    app.add_handler(CallbackQueryHandler(handle_no_extra_skills,     pattern="^no_extra_skills$"))
-    app.add_handler(CallbackQueryHandler(handle_ats_yes,               pattern="^ats_yes$"))
-    app.add_handler(CallbackQueryHandler(handle_ats_skip,              pattern="^ats_skip$"))
-    # Main menu buttons
-    app.add_handler(CallbackQueryHandler(handle_action_update_resume,  pattern="^action_update_resume$"))
-    app.add_handler(CallbackQueryHandler(handle_action_find_job,       pattern="^action_find_job$"))
-    app.add_handler(CallbackQueryHandler(handle_action_job_link,       pattern="^action_job_link$"))
-    # Resume choice buttons
-    app.add_handler(CallbackQueryHandler(handle_resume_use_saved,      pattern="^resume_use_saved$"))
-    app.add_handler(CallbackQueryHandler(handle_resume_view_saved,     pattern="^resume_view_saved$"))
-    app.add_handler(CallbackQueryHandler(handle_resume_upload_new,     pattern="^resume_upload_new$"))
-    # Job search buttons
-    app.add_handler(CallbackQueryHandler(handle_jp_role,               pattern="^jp_role_"))
-    app.add_handler(CallbackQueryHandler(handle_jp_city,               pattern="^jp_city_"))
-    app.add_handler(CallbackQueryHandler(handle_jp_exp,                pattern="^jp_exp_"))
-    app.add_handler(CallbackQueryHandler(handle_jp_time,               pattern="^jp_time_"))
-    app.add_handler(CallbackQueryHandler(handle_optimize_job,    pattern="^optimize_"))
-    # Exclude VOICE so state handlers (clarification, update) can catch it
-    app.add_handler(MessageHandler(filters.ALL & ~filters.VOICE, handle_fallback))
+    app.add_handler(CallbackQueryHandler(handle_update_confirm_go,    pattern="^update_confirm_go$"))
+    app.add_handler(CallbackQueryHandler(handle_update_confirm_more,  pattern="^update_confirm_more$"))
+    app.add_handler(CallbackQueryHandler(handle_skip_question,        pattern="^skip_question$"))
+    app.add_handler(CallbackQueryHandler(handle_no_extra_skills,      pattern="^no_extra_skills$"))
+    app.add_handler(CallbackQueryHandler(handle_ats_yes,              pattern="^ats_yes$"))
+    app.add_handler(CallbackQueryHandler(handle_ats_skip,             pattern="^ats_skip$"))
+    app.add_handler(CallbackQueryHandler(handle_action_update_resume, pattern="^action_update_resume$"))
+    app.add_handler(CallbackQueryHandler(handle_action_find_job,      pattern="^action_find_job$"))
+    app.add_handler(CallbackQueryHandler(handle_action_job_link,      pattern="^action_job_link$"))
+    app.add_handler(CallbackQueryHandler(handle_resume_use_saved,     pattern="^resume_use_saved$"))
+    app.add_handler(CallbackQueryHandler(handle_resume_view_saved,    pattern="^resume_view_saved$"))
+    app.add_handler(CallbackQueryHandler(handle_resume_upload_new,    pattern="^resume_upload_new$"))
+    app.add_handler(CallbackQueryHandler(handle_jp_role,              pattern="^jp_role_"))
+    app.add_handler(CallbackQueryHandler(handle_jp_city,              pattern="^jp_city_"))
+    app.add_handler(CallbackQueryHandler(handle_jp_exp,               pattern="^jp_exp_"))
+    app.add_handler(CallbackQueryHandler(handle_jp_time,              pattern="^jp_time_"))
+    app.add_handler(CallbackQueryHandler(handle_optimize_job,         pattern="^optimize_"))
+    app.add_handler(CallbackQueryHandler(handle_expired_buttons))
+    app.add_handler(MessageHandler(filters.ALL, handle_fallback))
 
     logger.info("Bot is running... Press Ctrl+C to stop.")
     app.run_polling(drop_pending_updates=True)
-
-
 if __name__ == "__main__":
     main()
